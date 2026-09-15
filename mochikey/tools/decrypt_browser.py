@@ -330,7 +330,16 @@ def firefox_master_keys(key4_path: str) -> dict:
     row = db.execute("SELECT item1, item2 FROM metaData "
                      "WHERE id = 'password-check'").fetchone()
     if row is None:
-        raise ValueError("metaData password-check missing")
+        try:
+            tables = [r[0] for r in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")]
+            ids = [r[0] for r in db.execute("SELECT id FROM metaData")] \
+                if "metaData" in tables else []
+        except sqlite3.Error as e:
+            tables, ids = ["<unreadable: %s>" % e], []
+        raise ValueError("password-check row missing (tables=%s ids=%s) — "
+                         "stale/partial copy? re-run Browser harvest"
+                         % (tables, ids))
     item1, global_salt = bytes(row[0]), bytes(row[1])
     clear, _ = firefox_item_decrypt(item1, global_salt)
     if not clear.startswith(b"password-check"):
